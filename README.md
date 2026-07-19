@@ -1,114 +1,116 @@
+***English** | [Français](README.fr.md)*
+
 # CHROMA V2
 
 **C**alibrated **H**istological **R**econstruction **O**f **M**ultiplexed **A**bsorbances
 
-Normaliseur colorimétrique pour lames **HES** (Hématoxyline–Éosine–Safran) qui
-travaille en **densité optique** et sépare la brightness de la chromaticité
-**avant** décomposition. Un seul fichier, `numpy` + `scikit-learn`, sans deep learning.
+A stain normalizer for **HES** slides (Hematoxylin–Eosin–Saffron) that works in
+**optical density** and separates brightness from chromaticity **before** decomposition.
+Single file, `numpy` + `scikit-learn`, no deep learning.
 
-![Comparatif natif / CHROMA V2 / Macenko en x20](assets/comparison_natif_chroma_macenko_x20.png)
+![Native / CHROMA V2 / Macenko comparison at x20](assets/comparison_natif_chroma_macenko_x20.png)
 
-*Patchs x20 de placenta. Colonne de gauche : image native (variabilité de coloration inter-lame).
-Milieu : CHROMA V2. Droite : Macenko. CHROMA harmonise la couleur en restant proche
-de l'image native (distance cosinus DINOv2 ≈ 0.02–0.03 vs natif, contre ≈ 0.05–0.09 pour
-Macenko sur les mêmes patchs) et préserve les pigments et les érythrocytes que Macenko efface.*
+*Placenta patches at x20. Left column: native image (inter-slide staining variability).
+Middle: CHROMA V2. Right: Macenko. CHROMA harmonizes color while staying close to the
+native image (DINOv2 cosine distance ≈ 0.02–0.03 vs native, against ≈ 0.05–0.09 for Macenko
+on the same patches) and preserves the pigments and red blood cells that Macenko erases.*
 
-## Pourquoi
+## Why
 
-La coloration HES varie d'une lame à l'autre (réactifs, âge du bain, scanner). Cette
-dérive colorimétrique perturbe autant l'œil du pathologiste que les encodeurs (DINOv2,
-CTransPath…). Les normaliseurs existants ont chacun un défaut :
+HES staining varies from slide to slide (reagents, bath age, scanner). This color drift
+disturbs both the pathologist's eye and encoders (DINOv2, CTransPath…). Existing normalizers
+each have a weakness:
 
-| Méthode | Limite |
+| Method | Limitation |
 |---|---|
-| **Macenko** (SVD, 2 composantes H&E) | Ignore le safran, instable par lame, détruit les pigments (méconium, hémosidérine) et les globules rouges |
-| **Reinhard** (Lab) | Sépare brightness/chromaticité mais dans un espace **perceptuel**, pas physique |
+| **Macenko** (SVD, 2 components H&E) | Ignores saffron, unstable per slide, destroys pigments (meconium, hemosiderin) and red blood cells |
+| **Reinhard** (Lab) | Separates brightness/chromaticity but in a **perceptual** space, not a physical one |
 
-**CHROMA** est la synthèse : espace OD (physique, additif par Beer-Lambert) + séparation
-brightness/chromaticité (l'idée de Reinhard) + décomposition biologique à 3 colorants.
+**CHROMA** is the synthesis: OD space (physical, additive via Beer-Lambert) + brightness/
+chromaticity separation (Reinhard's idea) + a biological 3-stain decomposition.
 
-### Le principe physique
+### The physical principle
 
-Les 3 colorants HES se comportent comme les 3 primaires soustractives **CMYK** :
-H ≈ Cyan, E ≈ Magenta, S ≈ Yellow, et un résiduel = Key (pigments). Le passage en densité
-optique rend le mélange **additif** :
-
-```
-OD = -log10(I / I0)          (loi de Beer-Lambert, I0 = fond clair par lame)
-```
-
-### La nouveauté V2 : retirer l'axe gris avant de décomposer
-
-L'axe gris `ĝ = [1,1,1]/√3` en OD encode la **variation d'épaisseur/brightness** sans
-couleur. En V1, il contaminait le canal safran (le safran « s'allumait » sur du tissu gris).
-V2 le retire **avant** la décomposition :
+The 3 HES stains behave like the 3 subtractive **CMYK** primaries: H ≈ Cyan, E ≈ Magenta,
+S ≈ Yellow, plus a residual = Key (pigments). Moving to optical density makes the mixture
+**additive**:
 
 ```
-T   (brightness)  = OD · ĝ                  épaisseur tissulaire, scalaire par pixel
-Sat (saturation)  = ‖OD − T·ĝ‖              intensité chromatique
-c   (concentrations) = pinv(S⊥) · (OD − T·ĝ), clampé ≥ 0   sur la chromaticité seule
-K   (résiduel)    = OD − (T·ĝ + S⊥·c)       pigments non expliqués
+OD = -log10(I / I0)          (Beer-Lambert law, I0 = bright background per slide)
 ```
 
-où `S⊥ = S − ĝ(ĝᵀS)` est la matrice de stain projetée hors de l'axe gris. Résultat :
-la brightness est portée par `T`, jamais par les colorants → le safran ne capte plus le gris.
+### The V2 novelty: remove the gray axis before decomposing
 
-### 7 canaux interprétables
+The gray axis `ĝ = [1,1,1]/√3` in OD encodes **thickness/brightness variation** without color.
+In V1 it contaminated the saffron channel (saffron would "light up" on gray tissue). V2 removes
+it **before** decomposition:
 
 ```
-RGB → OD ─┬─ T   [épaisseur tissulaire]
-          ├─ Sat [intensité chromatique]
-          └─ chromaticité ─ décomposition ─┬─ H [hématoxyline / noyaux]
-                                           ├─ E [éosine / cytoplasme]
-                                           ├─ S [safran / collagène]
-                                           └─ K [résiduel : méconium, hémosidérine, formol]
-
-Total : H, E, S, K, T, Sat + image normalisée
+T   (brightness)     = OD · ĝ                  tissue thickness, scalar per pixel
+Sat (saturation)     = ‖OD − T·ĝ‖              chromatic intensity
+c   (concentrations) = pinv(S⊥) · (OD − T·ĝ), clamped ≥ 0   on chromaticity only
+K   (residual)       = OD − (T·ĝ + S⊥·c)       unexplained pigments
 ```
 
-Le canal **K est laissé intact** pendant la normalisation : c'est l'avantage clé sur Macenko,
-qui écrase ces pigments diagnostiques. Le canal **H** décontaminé du gris isole la basophilie
-pure et se révèle un fort descripteur de la nécrose et de l'inflammation.
+where `S⊥ = S − ĝ(ĝᵀS)` is the stain matrix projected out of the gray axis. Result: brightness
+is carried by `T`, never by the stains → saffron no longer captures gray.
 
-## Calibration automatique
+### 7 interpretable channels
 
-Aucune annotation, aucune intervention humaine. On pool des pixels tissulaires (masque Otsu
-sur la saturation) de ~10 lames HES, on fait une NMF 3 composantes **ancrée** sur une base HES
-canonique (sinon la NMF est non-identifiable sur le cône HES), et on assigne H/E/S par canal
-d'absorption dominant. Un seul artefact site-spécifique : un fichier JSON de calibration.
+```
+RGB → OD ─┬─ T   [tissue thickness]
+          ├─ Sat [chromatic intensity]
+          └─ chromaticity ─ decomposition ─┬─ H [hematoxylin / nuclei]
+                                           ├─ E [eosin / cytoplasm]
+                                           ├─ S [saffron / collagen]
+                                           └─ K [residual: meconium, hemosiderin, formalin]
 
-## Utilisation
+Total: H, E, S, K, T, Sat + normalized image
+```
+
+The **K channel is left untouched** during normalization: this is the key advantage over
+Macenko, which wipes out these diagnostic pigments. The gray-decontaminated **H channel**
+isolates pure basophilia and turns out to be a strong descriptor of necrosis and inflammation.
+
+## Automatic calibration
+
+No annotation, no human intervention. We pool tissue pixels (Otsu mask on saturation) from
+~10 HES slides, run a 3-component NMF **anchored** on a canonical HES basis (otherwise NMF is
+non-identifiable on the HES cone), and assign H/E/S by dominant absorption channel. A single
+site-specific artifact: a JSON calibration file.
+
+## Usage
 
 ```python
 import numpy as np
 from PIL import Image
 import chroma
 
-# 1) calibrer une CIBLE sur ~10 vignettes RGB de lames HES (une fois par site/scanner)
+# 1) calibrate a TARGET on ~10 RGB thumbnails of HES slides (once per site/scanner)
 target = chroma.auto_calibrate([np.asarray(Image.open(p).convert("RGB")) for p in thumbs])
 norm = chroma.CHROMA(target)
 
-# 2) pour chaque lame à normaliser : calibrer sa SOURCE et fabriquer la fonction PIL→PIL
-src = chroma.auto_calibrate([np.asarray(Image.open("lame.png").convert("RGB"))])
+# 2) for each slide to normalize: calibrate its SOURCE and build the PIL→PIL function
+src = chroma.auto_calibrate([np.asarray(Image.open("slide.png").convert("RGB"))])
 stain_fn = chroma.make_stain_fn(src, norm)
 
-normalisee = stain_fn(Image.open("patch.png"))     # PIL.Image RGB normalisée
+normalized = stain_fn(Image.open("patch.png"))     # normalized RGB PIL.Image
 
-# 3) décomposition en 7 canaux (maps 2D)
-canaux = norm.decompose(np.asarray(Image.open("patch.png").convert("RGB")))
-H, E, S, K, T, Sat = (canaux[k] for k in ("H", "E", "S", "K", "T", "Sat"))
+# 3) decomposition into 7 channels (2D maps)
+channels = norm.decompose(np.asarray(Image.open("patch.png").convert("RGB")))
+H, E, S, K, T, Sat = (channels[k] for k in ("H", "E", "S", "K", "T", "Sat"))
 ```
 
-`stain_fn` se branche directement comme `torchvision.transforms.Lambda` dans un pipeline
-d'embeddings. Coût < 1 s par patch 224×224 sur CPU.
+`stain_fn` plugs directly in as a `torchvision.transforms.Lambda` in an embedding pipeline.
+Cost < 1 s per 224×224 patch on CPU.
 
-Self-check intégré :
+Built-in self-check:
 
 ```bash
-python chroma.py     # décontamination gris, reconstruction ≈ identité, gains OK
+python chroma.py     # gray decontamination, reconstruction ≈ identity, gains OK
 ```
 
-## Format de calibration (JSON)
+## Calibration format (JSON)
 
 ```json
 {
@@ -125,16 +127,16 @@ python chroma.py     # décontamination gris, reconstruction ≈ identité, gain
 }
 ```
 
-## Dépendances
+## Dependencies
 
-`numpy`, `scikit-learn`, `opencv-python`, `Pillow` (voir `requirements.txt`). Pas de framework,
-pas d'ORM, pas de GPU requis.
+`numpy`, `scikit-learn`, `opencv-python`, `Pillow` (see `requirements.txt`). No framework,
+no ORM, no GPU required.
 
-## Auteurs
+## Authors
 
-- **Rémi Mathevet** — fœtopathologiste — conception, spécification, validation clinique
-- **Claude** (Anthropic) — implémentation, décomposition gris-séparée, outillage QC
+- **Rémi Mathevet** — fetal pathologist — design, specification, clinical validation
+- **Claude** (Anthropic) — implementation, gray-separated decomposition, QC tooling
 
-## Licence
+## License
 
 Apache-2.0
