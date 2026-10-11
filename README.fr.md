@@ -85,8 +85,14 @@ pure et se révèle un fort descripteur de la nécrose et de l'inflammation.
 
 Aucune annotation, aucune intervention humaine. On pool des pixels tissulaires (masque Otsu
 sur la saturation) de ~10 lames HES, on fait une NMF 3 composantes **ancrée** sur une base HES
-canonique (sinon la NMF est non-identifiable sur le cône HES), et on assigne H/E/S par canal
-d'absorption dominant. Un seul artefact site-spécifique : un fichier JSON de calibration.
+canonique (sinon la NMF est non-identifiable sur le cône HES), et on assigne H/E/S par la
+permutation la plus proche de cette base (cosinus). Un seul artefact site-spécifique : un
+fichier JSON de calibration.
+
+**Cible médiane de site (2.3, recommandée).** Plutôt qu'une cible calibrée sur un petit pool,
+calibrer chaque lame (un JSON source par lame) puis prendre la médiane : `chroma.site_target(calibs)`
+(vecteurs, I0 et stats médians ; aucune lame relue). Sur notre site, une cible calibrée sur 10
+lames avait un vecteur hématoxyline tiré vers le rouge : après transfert, noyaux bleu-vert.
 
 ## Utilisation
 
@@ -105,6 +111,10 @@ stain_fn = chroma.make_stain_fn(src, norm)
 
 normalisee = stain_fn(Image.open("patch.png"))     # PIL.Image RGB normalisée
 
+# 2bis) transfert rang 3 (2.3) : exige `stats_full` dans la source et la cible
+#       (écrit par auto_calibrate ≥ 2.3 ; site_target le calcule aussi)
+stain_fn3 = chroma.make_stain_fn(src, norm, rank3=True)
+
 # 3) décomposition en 7 canaux (maps 2D)
 canaux = norm.decompose(np.asarray(Image.open("patch.png").convert("RGB")))
 H, E, S, K, T, Sat = (canaux[k] for k in ("H", "E", "S", "K", "T", "Sat"))
@@ -113,10 +123,32 @@ H, E, S, K, T, Sat = (canaux[k] for k in ("H", "E", "S", "K", "T", "Sat"))
 `stain_fn` se branche directement comme `torchvision.transforms.Lambda` dans un pipeline
 d'embeddings. Coût < 1 s par patch 224×224 sur CPU.
 
+### `normalize()` ou `transfer()` ?
+
+`normalize()` (défaut) travaille sur la chromaticité, gris retiré (rang 2). H⊥ et S⊥ y sont
+presque opposés : sur les pixels très sombres leurs concentrations s'annulent, et des gains
+différents par colorant cassent l'annulation → noyaux verts ou cyan. `transfer()`
+(`rank3=True`) décompose en rang 3 plein (`c = NNLS(S_source, OD)`), applique les gains
+`stats_full` cible/source, recompose sur les colorants cible, garde K, et revient au pixel
+natif en fondu là où le capteur sature (OD max de 1,2 à 1,8).
+
+Banc (400 patchs, 40 lames, vers la cible médiane de site) — part des patchs avec plus de
+0,5 % de pixels cyan nouveaux / dispersion inter-lames de la couleur moyenne du tissu en Lab :
+
+| | cyan | dispersion L / a* / b* |
+|---|---|---|
+| natif | — | 6,8 / 5,1 / 6,1 |
+| `normalize()` | 1,0 % | 6,0 / 9,4 / 5,3 |
+| `transfer()` | 0,2 % | 5,0 / 6,7 / 3,9 |
+
+Les deux augmentent la dispersion inter-lames sur a* : les gains par lame mêlent l'intensité
+du bain de coloration et la composition du tissu (une lame riche en éosine voit son E
+abaissé). `normalize()` reste le défaut pour que les embeddings existants restent comparables.
+
 Self-check intégré :
 
 ```bash
-python chroma.py     # décontamination gris, reconstruction ≈ identité, gains OK
+python chroma.py     # colorants purs, K hors-cône, ratios d'épaisseur, identité, transfert rang 3
 ```
 
 ## Format de calibration (JSON)
@@ -124,7 +156,7 @@ python chroma.py     # décontamination gris, reconstruction ≈ identité, gain
 ```json
 {
   "method": "NMF_auto_chroma_separated",
-  "chroma_version": "2.2",
+  "chroma_version": "2.3",
   "I0": [253.7, 253.6, 253.7],
   "stain_vectors": { "H": [...], "E": [...], "S": [...] },
   "stats": {
@@ -132,6 +164,7 @@ python chroma.py     # décontamination gris, reconstruction ≈ identité, gain
     "brightness_mu": 0.092, "brightness_sigma": 0.05,
     "sat_mu": 0.053, "sat_sigma": 0.03
   },
+  "stats_full": { "mu": [...], "sigma": [...], "frac_3": 0.98, "K_p95": 0.05 },
   "calib_id": "4d75cb66"
 }
 ```

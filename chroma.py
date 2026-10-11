@@ -28,7 +28,11 @@ from itertools import combinations, permutations
 
 import numpy as np
 
-__version__ = "2.2"
+__version__ = "2.3"
+
+# Transfert rang 3 : fondu vers le natif quand le capteur sature (OD max de 1,2 à 1,8 ;
+# au-delà la décomposition n'a plus de sens). Fondu et pas coupure : pas de bord net.
+FADE_OD = (1.2, 1.8)
 
 # Axe gris unitaire : direction [1,1,1] en OD = variation d'épaisseur/brightness sans
 # couleur. On la retire de l'OD avant décomposition pour que le safran ne capte pas le
@@ -104,6 +108,42 @@ def _conc_stats(c):
             med[j] = np.median(pos)
             scale[j] = 1.4826 * np.median(np.abs(pos - med[j])) + 1e-6
     return med, scale
+
+
+def _rank3_stats(od, S):
+    """Stats de concentration en RANG 3 (c = NNLS(S, od)) : gains de `CHROMA.transfer`.
+    `stats.mu` (rang 2) n'y convient pas : H⊥ et S⊥ s'y substituent, les concentrations
+    sont zéro-inflées et mu_t/mu_s explose (gain H jusqu'à 1e4 mesuré sur 40 lames)."""
+    c, K = _channels_rank3(od, S)
+    mu, sigma = _conc_stats(c)
+    kn = np.linalg.norm(K, axis=1)
+    return {"mu": mu.tolist(), "sigma": sigma.tolist(),
+            "frac_pos": (c > 1e-4).mean(0).tolist(), "frac_3": float((c > 1e-4).all(1).mean()),
+            "K_p50": float(np.median(kn)), "K_p95": float(np.percentile(kn, 95)),
+            "n_pixels": int(len(od))}
+
+
+def site_target(calibs, site=None):
+    """Cible MÉDIANE d'un site à partir de calibs source (chacune avec `stats_full`) :
+    vecteurs H/E/S médians renormalisés, I0 et stats médians. Pas de lecture de lame.
+    Préférée à une NMF sur un petit pool : la cible v2 (10 lames) avait un H tiré vers le
+    rouge → noyaux bleu-vert après transfert (5,5 % de patchs vs 0,2 % avec la médiane)."""
+    sv = {}
+    for k in ("H", "E", "S"):
+        v = np.median([np.asarray(c["stain_vectors"][k], float) / np.linalg.norm(c["stain_vectors"][k])
+                       for c in calibs], axis=0)
+        sv[k] = (v / np.linalg.norm(v)).tolist()
+    med = lambda f: np.median([f(c) for c in calibs], axis=0).tolist()
+    st = {k: med(lambda c, k=k: c["stats"][k]) for k in calibs[0]["stats"]}
+    out = {"method": "site_median", "chroma_version": __version__,
+           "I0": med(lambda c: c["I0"]), "stain_vectors": sv, "stats": st,
+           "stats_full": {"mu": med(lambda c: c["stats_full"]["mu"]),
+                          "sigma": med(lambda c: c["stats_full"]["sigma"])},
+           "n_slides": len(calibs)}
+    if site:
+        out["site"] = site
+    out["calib_id"] = calib_id(out)
+    return out
 
 
 def calib_id(calib: dict) -> str:
@@ -211,6 +251,7 @@ def auto_calibrate(thumbs, n_pixels_per=500_000, seed=0):
         "stats": {"mu": c_med.tolist(), "sigma": c_scale.tolist(),
                   "brightness_mu": float(b_med), "brightness_sigma": float(b_scale),
                   "sat_mu": float(s_med), "sat_sigma": float(s_scale)},
+        "stats_full": _rank3_stats(pool, S),
         "n_slides": len(thumbs),
         "n_pixels": int(len(pool)),
         "nmf_reconstruction_error": float(best_err),
@@ -270,6 +311,9 @@ class CHROMA:
         # stats brightness/saturation (optionnelles : absentes des calibs v1)
         self.bmu = st.get("brightness_mu")
         self.bsig = st.get("brightness_sigma")
+        # stats rang 3 (optionnelles : calibs < 2.3) — requises par transfer()
+        sf = target_calib.get("stats_full")
+        self.mu_full_target = None if sf is None else np.asarray(sf["mu"], float)
 
     @staticmethod
     def _od(img, I0):
@@ -337,14 +381,46 @@ class CHROMA:
         rgb = self.I0_target * (10.0 ** (-od_norm.reshape(h, w, 3)))
         return np.clip(rgb, 0, 255).astype(np.uint8)
 
+    def transfer(self, img, I0_source, S_source, mu_full_source, gains=None):
+        """img RGB uint8 → RGB uint8 vers la cible, en RANG 3 PLEIN (2.3).
 
-def apply_calib(rgb_uint8, source_calib: dict, norm: CHROMA, gains=None):
+        c = NNLS(S_source, od), gain multiplicatif mu_full_cible/mu_full_source borné
+        [1/z_clip, z_clip], recomposition sur les colorants cible, résidu K inchangé, fondu
+        vers le natif sur les pixels saturés (FADE_OD). Pas d'axe gris retiré : l'épaisseur
+        est proportionnelle dans c, donc conservée. Évite le défaut de normalize() (S⊥ de
+        rang 2, H⊥ ≈ −S⊥) : sur les pixels sombres c_H et c_S s'y annulent, des gains
+        différents cassent l'annulation → noyaux verts/cyan.
+        gains = (gH,gE,gS,gK) comme normalize (défaut 1)."""
+        if self.mu_full_target is None:
+            raise ValueError("cible sans stats_full : recalibrer en ≥ 2.3 ou utiliser site_target")
+        h, w = img.shape[:2]
+        od = self._od(img, I0_source).reshape(-1, 3)
+        c, K = _channels_rank3(od, S_source)
+        mu_s = np.asarray(mu_full_source, float)
+        g = np.divide(self.mu_full_target, mu_s, out=np.ones(3), where=mu_s > 1e-6)
+        c = c * np.clip(g, 1.0 / self.z_clip, self.z_clip)
+        if gains is not None:
+            c = c * np.asarray(gains[:3], float)
+            K = K * float(gains[3])
+        od2 = c @ self.S_target.T + K
+        lo, hi = FADE_OD
+        wt = np.clip((hi - od.max(1)) / (hi - lo), 0.0, 1.0)[:, None]   # 1 = transféré
+        od2 = wt * od2 + (1.0 - wt) * od
+        rgb = self.I0_target * (10.0 ** (-od2.reshape(h, w, 3)))
+        return np.clip(np.rint(rgb), 0, 255).astype(np.uint8)   # rint : natif rendu au bit près
+
+
+def apply_calib(rgb_uint8, source_calib: dict, norm: CHROMA, gains=None, rank3=False):
     """RGB uint8 → RGB uint8 normalisé, à partir d'une calib source (dict). Cœur partagé
-    par make_stain_fn (série) et le worker CHROMA du pool CPU (stain_norm.worker_init)."""
+    par make_stain_fn (série) et le worker CHROMA du pool CPU (stain_norm.worker_init).
+    rank3=True : CHROMA.transfer (2.3, exige stats_full source et cible) ; défaut False =
+    normalize() historique, pour ne pas changer les embeddings déjà calculés."""
     sv = source_calib["stain_vectors"]
     st = source_calib["stats"]
     I0_s = np.asarray(source_calib["I0"], float)
     S_s = np.column_stack([np.asarray(sv[k], float) for k in ("H", "E", "S")])
+    if rank3:
+        return norm.transfer(rgb_uint8, I0_s, S_s, source_calib["stats_full"]["mu"], gains=gains)
     mu_s = np.asarray(st["mu"], float)
     sig_s = np.asarray(st["sigma"], float)
     bright_s = (st["brightness_mu"], st["brightness_sigma"]) if "brightness_mu" in st else None
@@ -352,12 +428,12 @@ def apply_calib(rgb_uint8, source_calib: dict, norm: CHROMA, gains=None):
                           gains=gains)
 
 
-def make_stain_fn(source_calib: dict, norm: CHROMA):
+def make_stain_fn(source_calib: dict, norm: CHROMA, rank3=False):
     """Fabrique un callable PIL→PIL bindé à la calib source d'une lame (branché comme
     transforms.Lambda dans embed_multimag._build_transform)."""
     from PIL import Image
     return lambda im: Image.fromarray(
-        apply_calib(np.asarray(im.convert("RGB")), source_calib, norm))
+        apply_calib(np.asarray(im.convert("RGB")), source_calib, norm, rank3=rank3))
 
 
 def _demo():
@@ -416,8 +492,21 @@ def _demo():
     out_g0 = norm.normalize(img, I0, S, np.zeros(3), np.ones(3), gains=(0, 0, 0, 0))
     spread = out_g0.astype(float).std(axis=2).mean()
     assert spread < 2.0, f"gains=0 doit donner du gris (spread={spread:.2f})"
+
+    # 6) transfer (rang 3) : source == cible → identité
+    norm.mu_full_target = np.array([0.5, 0.5, 0.5])
+    out_t = norm.transfer(img, I0, S, norm.mu_full_target)
+    assert np.abs(out_t.astype(int) - img.astype(int)).mean() < 1.0, "transfer identité off"
+
+    # 7) noyau sombre, H doublé : reste bleu-violet (B ≥ G), jamais vert — le défaut de
+    #    normalize() que transfer corrige ; pixel saturé (OD max > FADE_OD[1]) laissé natif
+    nuc = patch(S @ np.array([1.2, 0.15, 0.05]))
+    o = norm.transfer(nuc, I0, S, norm.mu_full_target / np.array([2.0, 1.0, 1.0]))
+    assert o[..., 2].mean() >= o[..., 1].mean(), f"noyau vert après transfer : {o[0, 0]}"
+    sat = patch(np.full(3, 2.0))
+    assert np.array_equal(norm.transfer(sat, I0, S, norm.mu_full_target / 2), sat), "saturé modifié"
     print("chroma _demo OK — colorants purs séparés, K hors-cône, ratios invariants, "
-          "normalisation ≈ identité")
+          "normalisation ≈ identité, transfer rang 3 (identité, noyau sombre, saturés)")
 
 
 if __name__ == "__main__":

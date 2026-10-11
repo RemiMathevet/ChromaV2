@@ -85,8 +85,13 @@ isolates pure basophilia and turns out to be a strong descriptor of necrosis and
 
 No annotation, no human intervention. We pool tissue pixels (Otsu mask on saturation) from
 ~10 HES slides, run a 3-component NMF **anchored** on a canonical HES basis (otherwise NMF is
-non-identifiable on the HES cone), and assign H/E/S by dominant absorption channel. A single
-site-specific artifact: a JSON calibration file.
+non-identifiable on the HES cone), and assign H/E/S by the permutation that best matches that
+basis (cosine). A single site-specific artifact: a JSON calibration file.
+
+**Site-median target (2.3, recommended).** Rather than a target calibrated on a small pool,
+calibrate every slide (one source JSON each), then take the median: `chroma.site_target(calibs)`
+(median stain vectors, I0 and stats; no slide is re-read). On our site, a target calibrated on
+10 slides had a hematoxylin vector pulled towards red; after transfer, nuclei turned blue-green.
 
 ## Usage
 
@@ -105,6 +110,10 @@ stain_fn = chroma.make_stain_fn(src, norm)
 
 normalized = stain_fn(Image.open("patch.png"))     # normalized RGB PIL.Image
 
+# 2bis) rank-3 transfer (2.3): needs `stats_full` in source and target
+#       (written by auto_calibrate ≥ 2.3; site_target computes it too)
+stain_fn3 = chroma.make_stain_fn(src, norm, rank3=True)
+
 # 3) decomposition into 7 channels (2D maps)
 channels = norm.decompose(np.asarray(Image.open("patch.png").convert("RGB")))
 H, E, S, K, T, Sat = (channels[k] for k in ("H", "E", "S", "K", "T", "Sat"))
@@ -113,10 +122,32 @@ H, E, S, K, T, Sat = (channels[k] for k in ("H", "E", "S", "K", "T", "Sat"))
 `stain_fn` plugs directly in as a `torchvision.transforms.Lambda` in an embedding pipeline.
 Cost < 1 s per 224×224 patch on CPU.
 
+### `normalize()` or `transfer()`?
+
+`normalize()` (default) works on chromaticity, gray removed (rank 2). There, H⊥ and S⊥ are
+almost opposite: on very dark pixels their concentrations cancel out, and per-stain gains
+break the cancellation → green/cyan nuclei. `transfer()` (`rank3=True`) decomposes at full
+rank 3 (`c = NNLS(S_source, OD)`), applies the gains `stats_full` target/source, recomposes
+on the target stains, keeps K, and fades back to the native pixel where the sensor saturates
+(max OD 1.2 → 1.8).
+
+Benchmark (400 patches, 40 slides, towards the site-median target) — share of patches
+with > 0.5 % new cyan pixels / inter-slide spread of the mean tissue color in Lab:
+
+| | cyan | spread L / a* / b* |
+|---|---|---|
+| native | — | 6.8 / 5.1 / 6.1 |
+| `normalize()` | 1.0 % | 6.0 / 9.4 / 5.3 |
+| `transfer()` | 0.2 % | 5.0 / 6.7 / 3.9 |
+
+Both increase the inter-slide spread on a*: per-slide gains mix the intensity of the stain
+bath with the tissue composition (an eosin-rich slide gets its E lowered). `normalize()`
+stays the default so that existing embeddings remain comparable.
+
 Built-in self-check:
 
 ```bash
-python chroma.py     # gray decontamination, reconstruction ≈ identity, gains OK
+python chroma.py     # pure stains, out-of-cone K, thickness ratios, identity, rank-3 transfer
 ```
 
 ## Calibration format (JSON)
@@ -124,7 +155,7 @@ python chroma.py     # gray decontamination, reconstruction ≈ identity, gains 
 ```json
 {
   "method": "NMF_auto_chroma_separated",
-  "chroma_version": "2.2",
+  "chroma_version": "2.3",
   "I0": [253.7, 253.6, 253.7],
   "stain_vectors": { "H": [...], "E": [...], "S": [...] },
   "stats": {
@@ -132,6 +163,7 @@ python chroma.py     # gray decontamination, reconstruction ≈ identity, gains 
     "brightness_mu": 0.092, "brightness_sigma": 0.05,
     "sat_mu": 0.053, "sat_sigma": 0.03
   },
+  "stats_full": { "mu": [...], "sigma": [...], "frac_3": 0.98, "K_p95": 0.05 },
   "calib_id": "4d75cb66"
 }
 ```
