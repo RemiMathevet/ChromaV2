@@ -48,12 +48,21 @@ it **before** decomposition:
 ```
 T   (brightness)     = OD · ĝ                  tissue thickness, scalar per pixel
 Sat (saturation)     = ‖OD − T·ĝ‖              chromatic intensity
-c   (concentrations) = pinv(S⊥) · (OD − T·ĝ), clamped ≥ 0   on chromaticity only
+c   (concentrations) = NNLS(S⊥, OD − T·ĝ) ≥ 0   on chromaticity only
 K   (residual)       = OD − (T·ĝ + S⊥·c)       unexplained pigments
 ```
 
 where `S⊥ = S − ĝ(ĝᵀS)` is the stain matrix projected out of the gray axis. Result: brightness
-is carried by `T`, never by the stains → saffron no longer captures gray.
+is carried by `T`, never by the stains → saffron no longer captures gray. This rank-2 path is
+used by `normalize()` only.
+
+`decompose()` (since 2.2) works at **full rank 3**, gray axis kept: `c = NNLS(S, OD)`,
+`K = ‖OD − S·c‖` = true out-of-cone residual. In rank 2, `S⊥` spans the whole chromatic plane,
+so H/E/S are not identifiable and K is only a clipping residual. Thickness invariance in rank 3
+comes from the ratios (`Cellularite = H/E`, `Fibrose = S/(H+E)`).
+
+Since 2.2, H/E/S are assigned to the NMF vectors by the permutation maximizing cosine similarity
+to the canonical basis (2.0 used a single-channel argmax that swapped H and S on RGB input).
 
 ### 7 interpretable channels
 
@@ -115,7 +124,7 @@ python chroma.py     # gray decontamination, reconstruction ≈ identity, gains 
 ```json
 {
   "method": "NMF_auto_chroma_separated",
-  "chroma_version": "2.0",
+  "chroma_version": "2.2",
   "I0": [253.7, 253.6, 253.7],
   "stain_vectors": { "H": [...], "E": [...], "S": [...] },
   "stats": {

@@ -48,12 +48,21 @@ V2 le retire **avant** la décomposition :
 ```
 T   (brightness)  = OD · ĝ                  épaisseur tissulaire, scalaire par pixel
 Sat (saturation)  = ‖OD − T·ĝ‖              intensité chromatique
-c   (concentrations) = pinv(S⊥) · (OD − T·ĝ), clampé ≥ 0   sur la chromaticité seule
+c   (concentrations) = NNLS(S⊥, OD − T·ĝ) ≥ 0   sur la chromaticité seule
 K   (résiduel)    = OD − (T·ĝ + S⊥·c)       pigments non expliqués
 ```
 
 où `S⊥ = S − ĝ(ĝᵀS)` est la matrice de stain projetée hors de l'axe gris. Résultat :
 la brightness est portée par `T`, jamais par les colorants → le safran ne capte plus le gris.
+Ce chemin de rang 2 sert uniquement à `normalize()`.
+
+`decompose()` (depuis 2.2) travaille en **rang 3 plein**, axe gris conservé : `c = NNLS(S, OD)`,
+`K = ‖OD − S·c‖` = vrai résidu hors-cône. En rang 2, `S⊥` engendre tout le plan chromatique :
+H/E/S n'y sont pas identifiables et K n'est qu'un résidu d'écrêtage. L'invariance d'épaisseur
+en rang 3 passe par les ratios (`Cellularite = H/E`, `Fibrose = S/(H+E)`).
+
+Depuis 2.2, H/E/S sont assignés aux vecteurs NMF par la permutation qui maximise le cosinus à
+la base canonique (la 2.0 utilisait un argmax mono-canal qui inversait H et S sur une entrée RGB).
 
 ### 7 canaux interprétables
 
@@ -115,7 +124,7 @@ python chroma.py     # décontamination gris, reconstruction ≈ identité, gain
 ```json
 {
   "method": "NMF_auto_chroma_separated",
-  "chroma_version": "2.0",
+  "chroma_version": "2.2",
   "I0": [253.7, 253.6, 253.7],
   "stain_vectors": { "H": [...], "E": [...], "S": [...] },
   "stats": {
